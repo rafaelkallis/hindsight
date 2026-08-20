@@ -226,3 +226,55 @@ class TestStaticKeysTenantExtensionLoader:
         assert isinstance(ext, StaticKeysTenantExtension)
         assert ext.schema_prefix == "tenant"
         assert ext._users == {"rafael": "tenant_rafael", "sophie": "tenant_sophie"}
+
+
+@pytest.fixture
+def memory_with_static_keys(memory):
+    """Memory engine with StaticKeysTenantExtension wired in."""
+    tenant_ext = StaticKeysTenantExtension({"users": "rafael:key-a,sophie:key-b"})
+    # The extension needs its ExtensionContext set for schema provisioning —
+    # mirror exactly what load_extension() does in production.
+    tenant_ext.set_context(memory._ext_ctx)
+    memory._tenant_extension = tenant_ext
+    return memory
+
+
+class TestStaticKeysTenantEngineAuth:
+    """Tests for tenant authentication enforced by the MemoryEngine."""
+
+    @pytest.mark.asyncio
+    async def test_retain_requires_request_context(self, memory_with_static_keys):
+        with pytest.raises(AuthenticationError, match="RequestContext is required"):
+            await memory_with_static_keys.retain_batch_async(
+                bank_id="test-bank",
+                contents=[{"content": "test"}],
+                request_context=None,
+            )
+
+    @pytest.mark.asyncio
+    async def test_retain_fails_with_invalid_key(self, memory_with_static_keys):
+        with pytest.raises(AuthenticationError, match="Invalid API key"):
+            await memory_with_static_keys.retain_batch_async(
+                bank_id="test-bank",
+                contents=[{"content": "test"}],
+                request_context=RequestContext(api_key="wrong-key"),
+            )
+
+    @pytest.mark.asyncio
+    async def test_retain_succeeds_with_valid_key(self, memory_with_static_keys):
+        # Should not raise — first call provisions the schema via run_migration.
+        await memory_with_static_keys.retain_batch_async(
+            bank_id="test-bank-tenant",
+            contents=[{"content": "test content"}],
+            request_context=RequestContext(api_key="key-a"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_recall_fails_with_invalid_key(self, memory_with_static_keys):
+        with pytest.raises(AuthenticationError, match="Invalid API key"):
+            await memory_with_static_keys.recall_async(
+                bank_id="test-bank",
+                query="test query",
+                fact_type=["world"],
+                request_context=RequestContext(api_key="wrong-key"),
+            )
