@@ -116,16 +116,14 @@ class StaticKeysTenantExtension(TenantExtension):
                 continue
             if ":" not in entry:
                 raise ValueError(
-                    f"Invalid HINDSIGHT_API_TENANT_USERS entry '{entry}'. "
-                    'Expected format "user_id:api_key".'
+                    f"Invalid HINDSIGHT_API_TENANT_USERS entry '{entry}'. Expected format \"user_id:api_key\"."
                 )
             user_id, api_key = entry.split(":", 1)
             user_id = user_id.strip()
             api_key = api_key.strip()
             if not user_id or not api_key:
                 raise ValueError(
-                    f"Invalid HINDSIGHT_API_TENANT_USERS entry '{entry}'. "
-                    "user_id and api_key must be non-empty."
+                    f"Invalid HINDSIGHT_API_TENANT_USERS entry '{entry}'. user_id and api_key must be non-empty."
                 )
             if not _USER_ID_RE.match(user_id):
                 raise ValueError(

@@ -1,13 +1,14 @@
 """Tests for StaticKeysTenantExtension (env-configured per-user API keys)."""
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
 from hindsight_api.extensions.builtin.multi_key_tenant import StaticKeysTenantExtension
 from hindsight_api.extensions.context import ExtensionContext
-from hindsight_api.extensions.tenant import AuthenticationError, Tenant, TenantContext, TenantExtension
 from hindsight_api.extensions.loader import load_extension
+from hindsight_api.extensions.tenant import AuthenticationError, Tenant, TenantContext, TenantExtension
 from hindsight_api.models import RequestContext
-from unittest.mock import AsyncMock, patch
 
 
 def _make_config(**overrides) -> dict[str, str]:
