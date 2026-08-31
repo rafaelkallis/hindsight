@@ -1,10 +1,11 @@
 """Tests for StaticKeysTenantExtension (env-configured per-user API keys)."""
 
+import hmac
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from hindsight_api.extensions.builtin.multi_key_tenant import StaticKeysTenantExtension
+from hindsight_api.extensions.builtin.multi_key_tenant import StaticKeysTenantExtension, _KeyEntry
 from hindsight_api.extensions.context import ExtensionContext
 from hindsight_api.extensions.loader import load_extension
 from hindsight_api.extensions.tenant import AuthenticationError, Tenant, TenantContext, TenantExtension
@@ -31,8 +32,8 @@ class TestStaticKeysTenantExtensionInit:
         ext = _make_extension()
         assert ext.schema_prefix == "user"
         assert ext._key_to_user == {
-            "key-a": ("rafael", "user_rafael"),
-            "key-b": ("sophie", "user_sophie"),
+            "key-a": _KeyEntry(user_id="rafael", schema_name="user_rafael"),
+            "key-b": _KeyEntry(user_id="sophie", schema_name="user_sophie"),
         }
         assert ext._users == {"rafael": "user_rafael", "sophie": "user_sophie"}
         assert ext.mcp_auth_disabled is False
@@ -88,10 +89,30 @@ class TestStaticKeysTenantExtensionInit:
     def test_init_multiple_keys_same_user(self):
         ext = _make_extension(users="rafael:key-a,rafael:key-b")
         assert ext._key_to_user == {
-            "key-a": ("rafael", "user_rafael"),
-            "key-b": ("rafael", "user_rafael"),
+            "key-a": _KeyEntry(user_id="rafael", schema_name="user_rafael"),
+            "key-b": _KeyEntry(user_id="rafael", schema_name="user_rafael"),
         }
         assert ext._users == {"rafael": "user_rafael"}
+
+    def test_init_rejects_schema_collision_after_dash_normalization(self):
+        # "jane-doe" and "jane_doe" both normalize to user_jane_doe — two
+        # distinct users must never share one isolated schema.
+        with pytest.raises(ValueError, match="already claimed"):
+            _make_extension(users="jane-doe:k1,jane_doe:k2")
+
+    def test_init_rejects_schema_name_over_63_chars(self):
+        long_user = "u" * 62
+        with pytest.raises(ValueError, match="exceeds the PostgreSQL identifier limit"):
+            _make_extension(users=f"{long_user}:key-a")
+
+    def test_init_rejects_duplicate_api_key(self):
+        with pytest.raises(ValueError, match="Duplicate API key"):
+            _make_extension(users="alice:k1,bob:k1")
+
+    def test_init_multiple_keys_same_user_does_not_collide(self):
+        # The legitimate multi-key-per-user case must not raise.
+        ext = _make_extension(users="alice:k1,alice:k2")
+        assert ext._users == {"alice": "user_alice"}
 
     def test_is_tenant_extension_subclass(self):
         ext = _make_extension()
@@ -125,6 +146,39 @@ class TestStaticKeysTenantExtensionAuthenticate:
         ext = _make_extension()
         with pytest.raises(AuthenticationError, match="Invalid API key"):
             await ext.authenticate(RequestContext(api_key="wrong-key"))
+
+    @pytest.mark.asyncio
+    async def test_authenticate_non_ascii_key_is_401_not_500(self):
+        # Header values arrive latin-1-decoded, so a byte >= 0x80 (here 'é',
+        # U+00E9) is a legitimate non-ASCII str. It must be rejected as an
+        # invalid key (AuthenticationError -> 401), not raise TypeError out of
+        # authenticate() (which would be a 500) the way str-vs-str
+        # hmac.compare_digest does.
+        ext = _make_extension()
+        with pytest.raises(AuthenticationError, match="Invalid API key"):
+            await ext.authenticate(RequestContext(api_key="\xe9"))
+
+    @pytest.mark.asyncio
+    async def test_authenticate_compares_all_keys_in_constant_time(self, monkeypatch):
+        # Regression pin for the auth fix: there is no exact-equality fast path
+        # anymore — an unknown key must run hmac.compare_digest over EVERY
+        # configured key, on bytes (not str, which would TypeError on non-ASCII).
+        ext = _make_extension()
+        compared: list[tuple[bytes, bytes]] = []
+        orig = hmac.compare_digest
+
+        def spy(a, b):
+            compared.append((a, b))
+            return orig(a, b)
+
+        monkeypatch.setattr("hindsight_api.extensions.builtin.multi_key_tenant.hmac.compare_digest", spy)
+
+        with pytest.raises(AuthenticationError, match="Invalid API key"):
+            await ext.authenticate(RequestContext(api_key="wrong-key"))
+
+        assert len(compared) == len(ext._key_to_user), "every configured key must be compared"
+        assert compared, "compare_digest must always run over all keys (no fast path)"
+        assert all(isinstance(a, bytes) and isinstance(b, bytes) for a, b in compared)
 
     @pytest.mark.asyncio
     async def test_authenticate_sets_usage_metering_fields(self):

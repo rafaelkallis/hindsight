@@ -36,6 +36,7 @@ from __future__ import annotations
 import hmac
 import logging
 import re
+from dataclasses import dataclass
 
 from hindsight_api.config import get_config
 from hindsight_api.extensions.tenant import AuthenticationError, Tenant, TenantContext, TenantExtension
@@ -52,6 +53,20 @@ _SCHEMA_PREFIX_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 # component: start with a letter/underscore, then letters/digits/underscore/dash.
 # Dashes are normalized to underscores before building the schema name.
 _USER_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+
+# PostgreSQL truncates identifiers to NAMEDATALEN (63) bytes. An operator can
+# configure two distinct user ids that differ only past that boundary; both
+# would land on the same truncated schema and silently share memories. Reject
+# at init rather than discovering the collision at runtime.
+_MAX_SCHEMA_LENGTH = 63
+
+
+@dataclass(frozen=True)
+class _KeyEntry:
+    """A configured API key's mapping: the owning user and its isolated schema."""
+
+    user_id: str
+    schema_name: str
 
 
 class StaticKeysTenantExtension(TenantExtension):
@@ -103,11 +118,11 @@ class StaticKeysTenantExtension(TenantExtension):
                 "Must be a valid Postgres identifier (letters, digits, underscores, starting with a letter or underscore)."
             )
 
-        # Parse users into an API-key -> (user_id, schema_name) map.
-        # Multiple keys may map to the same user. Also keep a per-user map so
-        # list_tenants() can return every configured tenant, even before any
-        # authentication has happened.
-        self._key_to_user: dict[str, tuple[str, str]] = {}
+        # Parse users into an API-key -> _KeyEntry map. Multiple keys may map
+        # to the same user. Also keep a per-user map so list_tenants() can
+        # return every configured tenant, even before any authentication has
+        # happened.
+        self._key_to_user: dict[str, _KeyEntry] = {}
         self._users: dict[str, str] = {}  # user_id -> schema_name
 
         for entry in users_raw.split(","):
@@ -131,10 +146,36 @@ class StaticKeysTenantExtension(TenantExtension):
                     "Must start with a letter or underscore, then letters, digits, underscores or dashes."
                 )
 
+            # Each schema must be a unique isolation boundary. Two distinct
+            # users whose ids normalize to the same schema (e.g. "jane-doe" and
+            # "jane_doe"), or that collide past the 63-byte identifier limit,
+            # would silently read and write each other's memories — reject
+            # loudly instead of breaking the extension's isolation guarantee.
             safe_user_id = user_id.replace("-", "_")
             schema_name = f"{self.schema_prefix}_{safe_user_id}"
-            # Multiple keys may map to the same user (and thus the same schema).
-            self._key_to_user[api_key] = (user_id, schema_name)
+            if len(schema_name) > _MAX_SCHEMA_LENGTH:
+                raise ValueError(
+                    f"Schema name '{schema_name}' for user_id '{user_id}' exceeds the PostgreSQL "
+                    f"identifier limit of {_MAX_SCHEMA_LENGTH} characters."
+                )
+            existing = self._users.get(user_id)
+            if existing is not None and existing != schema_name:
+                raise ValueError(
+                    f"Schema name collision for user_id '{user_id}': "
+                    f"'{existing}' vs '{schema_name}'. User ids must map to distinct schemas."
+                )
+            claimed_by = next((uid for uid, s in self._users.items() if uid != user_id and s == schema_name), None)
+            if claimed_by is not None:
+                raise ValueError(
+                    f"Schema name '{schema_name}' for user_id '{user_id}' is already claimed by "
+                    f"user_id '{claimed_by}'. Two distinct users cannot share one schema."
+                )
+            if api_key in self._key_to_user:
+                raise ValueError(
+                    f"Duplicate API key '{api_key}' in HINDSIGHT_API_TENANT_USERS. Each key must be unique."
+                )
+
+            self._key_to_user[api_key] = _KeyEntry(user_id=user_id, schema_name=schema_name)
             self._users[user_id] = schema_name
 
         # Track initialized schemas to avoid redundant migrations
@@ -163,19 +204,25 @@ class StaticKeysTenantExtension(TenantExtension):
         if not key:
             raise AuthenticationError("Missing Authorization header. Expected: Bearer <api_key>")
 
-        match = self._key_to_user.get(key)
-        if match is None:
-            # Constant-time comparison against each configured key to avoid
-            # timing side-channels on the key value itself.
-            for configured_key, (user_id, schema_name) in self._key_to_user.items():
-                if hmac.compare_digest(key, configured_key):
-                    match = (user_id, schema_name)
-                    break
+        # Compare against every configured key in constant time. The dict fast
+        # path is deliberately absent: an exact-equality lookup would leak the
+        # key's position/size via timing AND mean unknown keys never ran the
+        # constant-time loop — compare_digest must always run over all entries.
+        # Keys (and header values) arrive latin-1-decoded, so encode with
+        # "surrogateescape" so any byte sequence round-trips losslessly
+        # instead of raising TypeError (which would surface as a 500, not a 401)
+        # for non-ASCII bearer tokens.
+        key_bytes = key.encode("utf-8", "surrogateescape")
+        match: _KeyEntry | None = None
+        for configured_key, entry in self._key_to_user.items():
+            if hmac.compare_digest(key_bytes, configured_key.encode("utf-8", "surrogateescape")):
+                match = entry
+                break
 
         if match is None:
             raise AuthenticationError("Invalid API key")
 
-        user_id, schema_name = match
+        user_id, schema_name = match.user_id, match.schema_name
 
         # Initialize schema on first access
         if schema_name not in self._initialized_schemas:
