@@ -51,7 +51,8 @@ _SCHEMA_PREFIX_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 # User IDs appear in schema names, so they must be safe as a Postgres identifier
 # component: start with a letter/underscore, then letters/digits/underscore/dash.
-# Dashes are normalized to underscores before building the schema name.
+# Dashes are normalized to underscores and the whole id is lowercased before
+# building the schema name (Postgres folds unquoted identifiers to lowercase).
 _USER_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 
 # PostgreSQL truncates identifiers to NAMEDATALEN (63) bytes. An operator can
@@ -75,8 +76,8 @@ class StaticKeysTenantExtension(TenantExtension):
 
     Each entry in ``HINDSIGHT_API_TENANT_USERS`` is a ``user_id:api_key`` pair.
     Multiple keys may map to the same user. Authenticated requests are mapped to
-    schema ``{prefix}_{user_id}`` (dashes in the user id normalized to underscores),
-    provisioned lazily on first access.
+    schema ``{prefix}_{user_id}`` (user ids are lowercased, dashes normalized to
+    underscores), provisioned lazily on first access.
 
     Example:
         HINDSIGHT_API_TENANT_USERS=rafael:key-a,sophie:key-b
@@ -146,11 +147,23 @@ class StaticKeysTenantExtension(TenantExtension):
                     "Must start with a letter or underscore, then letters, digits, underscores or dashes."
                 )
 
+            # Normalize the user id to lowercase. PostgreSQL folds unquoted
+            # identifiers to lowercase at query time (the runtime's fq_table()
+            # does not quote the schema, while the migration path creates it
+            # quoted), so a mixed-case id like "Rafael" and its lowercase twin
+            # "rafael" would collapse to the same schema at runtime — either
+            # breaking every query or, worse, silently sharing one schema
+            # between two users. Lowercasing makes case variants the same
+            # canonical user (consistent with Postgres folding), so they merge
+            # onto one schema rather than drifting apart.
+            user_id = user_id.lower()
+
             # Each schema must be a unique isolation boundary. Two distinct
-            # users whose ids normalize to the same schema (e.g. "jane-doe" and
-            # "jane_doe"), or that collide past the 63-byte identifier limit,
-            # would silently read and write each other's memories — reject
-            # loudly instead of breaking the extension's isolation guarantee.
+            # users whose ids differ in non-case ways yet normalize to the same
+            # schema (e.g. "jane-doe" and "jane_doe"), or that collide past the
+            # 63-byte identifier limit, would silently read and write each
+            # other's memories — reject loudly instead of breaking the
+            # extension's isolation guarantee.
             safe_user_id = user_id.replace("-", "_")
             schema_name = f"{self.schema_prefix}_{safe_user_id}"
             if len(schema_name) > _MAX_SCHEMA_LENGTH:

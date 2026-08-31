@@ -38,6 +38,8 @@ For other multi-tenant setups with separate schemas per tenant (e.g., custom JWT
 
 A fully self-hosted multi-user mode: users and their API keys are declared in environment variables (no external identity provider, no users table). Each user maps to their own PostgreSQL schema (`{prefix}_{user_id}`), provisioned lazily on first access, giving database-level memory isolation between users. Multiple API keys may map to the same user and schema.
 
+User IDs are case-insensitive: they are lowercased (and dashes normalized to underscores) before building the schema name, so `Rafael`, `rafael` and `RAFAEL` all resolve to the same tenant schema.
+
 ```bash
 HINDSIGHT_API_TENANT_EXTENSION=hindsight_api.extensions.builtin.multi_key_tenant:StaticKeysTenantExtension
 # Comma-separated user_id:api_key pairs. Required.

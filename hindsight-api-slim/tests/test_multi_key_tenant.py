@@ -86,6 +86,38 @@ class TestStaticKeysTenantExtensionInit:
         ext = _make_extension(users="my-user-1:key-a")
         assert ext._users == {"my-user-1": "user_my_user_1"}
 
+    def test_init_normalizes_mixed_case_user_id_to_lowercase(self):
+        # "Rafael" must land on schema "user_rafael": Postgres folds unquoted
+        # identifiers to lowercase at runtime (fq_table does not quote the
+        # schema), so a mixed-case schema would break every query — or worse,
+        # collapse two users onto one schema. Lowercasing up front keeps the
+        # isolation guarantee.
+        ext = _make_extension(users="Rafael:key-a")
+        assert ext._users == {"rafael": "user_rafael"}
+        assert ext._key_to_user == {"key-a": _KeyEntry(user_id="rafael", schema_name="user_rafael")}
+
+    def test_init_normalizes_mixed_case_prefix_and_dashes(self):
+        # Mixed case + dashes must normalize to a single stable lowercased schema.
+        ext = _make_extension(users="My-User-1:key-a")
+        assert ext._users == {"my-user-1": "user_my_user_1"}
+
+    def test_init_rejects_mixed_case_dash_collision(self):
+        # "Jane-Doe" and "jane_doe" are different spellings that normalize to
+        # the same schema (lowercased + dashes to underscores) — two distinct
+        # user ids must never share one isolated schema.
+        with pytest.raises(ValueError, match="already claimed"):
+            _make_extension(users="Jane-Doe:k1,jane_doe:k2")
+
+    def test_init_accepts_case_insensitive_duplicate_user(self):
+        # The same user written with different case is the same tenant, so its
+        # keys may coexist on one schema.
+        ext = _make_extension(users="Rafael:k1,rafael:k2")
+        assert ext._users == {"rafael": "user_rafael"}
+        assert ext._key_to_user == {
+            "k1": _KeyEntry(user_id="rafael", schema_name="user_rafael"),
+            "k2": _KeyEntry(user_id="rafael", schema_name="user_rafael"),
+        }
+
     def test_init_multiple_keys_same_user(self):
         ext = _make_extension(users="rafael:key-a,rafael:key-b")
         assert ext._key_to_user == {
@@ -194,6 +226,20 @@ class TestStaticKeysTenantExtensionAuthenticate:
         assert ctx.api_key_id == "rafael"
 
     @pytest.mark.asyncio
+    async def test_authenticate_mixed_case_key_maps_to_lowercase_schema(self):
+        # A user configured with a mixed-case id authenticates onto the
+        # lowercased schema, matching what the runtime's fq_table() resolves.
+        ext = _make_extension(users="Rafael:key-a")
+        mock_context = AsyncMock(spec=ExtensionContext)
+        mock_context.run_migration = AsyncMock()
+        ext._context = mock_context
+
+        result = await ext.authenticate(RequestContext(api_key="key-a"))
+
+        assert result.schema_name == "user_rafael"
+        mock_context.run_migration.assert_called_once_with("user_rafael")
+
+    @pytest.mark.asyncio
     async def test_authenticate_provisions_schema_once(self):
         ext = _make_extension()
         mock_context = AsyncMock(spec=ExtensionContext)
@@ -261,6 +307,19 @@ class TestStaticKeysTenantExtensionListTenants:
         tenants = await ext.list_tenants()
         assert all(t.tenant_id is not None for t in tenants)
         assert {t.tenant_id for t in tenants} == {"rafael", "sophie"}
+
+    @pytest.mark.asyncio
+    async def test_list_tenants_uses_lowercased_user_ids(self):
+        # Mixed-case ids are normalized at init, so list_tenants() must hand
+        # the worker the same lowercased tenant_id and schema it authenticates
+        # onto — otherwise the consolidation reconcile sweep would build a
+        # RequestContext that never matches an authenticated tenant.
+        ext = _make_extension(users="Rafael:key-a,Sophie:key-b")
+        tenants = await ext.list_tenants()
+        assert tenants == [
+            Tenant(schema="user_rafael", tenant_id="rafael"),
+            Tenant(schema="user_sophie", tenant_id="sophie"),
+        ]
 
 
 class TestStaticKeysTenantExtensionLoader:
